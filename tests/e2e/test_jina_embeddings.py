@@ -43,6 +43,8 @@ def test_jina_embeddings_e2e():
     ]
 
     try:
+        # No pooler override needed: vLLM auto-detects mean pooling from the
+        # repo's sentence-transformers configuration (1_Pooling/config.json).
         llm = LLM(
             model=MODEL_ID,
             runner="pooling",
@@ -50,7 +52,6 @@ def test_jina_embeddings_e2e():
             max_model_len=max_model_len,
             dtype="float32",
             trust_remote_code=True,
-            override_pooler_config={"pooling_type": "MEAN"},
             tensor_parallel_size=1,
         )
     except Exception as e:
