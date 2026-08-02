@@ -24,10 +24,13 @@ source ~/vllm-env/bin/activate
 ## 3. Install vLLM TPU stack, then overlay the repo editable
 
 ```bash
-python -m pip install vllm-tpu
+python -m pip install vllm-tpu==0.26.0           # version this runbook was validated against
 python -m pip install -e .                       # CRITICAL — see below
 python -m pip install onnxruntime transformers   # for the parity test
 ```
+
+(Validated environment: `vllm-tpu 0.26.0`, `jax/jaxlib 0.11.0`,
+`libtpu 0.0.44`, python 3.12.)
 
 The editable install is **required**: `vllm serve` spawns API-server and
 engine subprocesses that import `tpu_inference` from site-packages, not from
