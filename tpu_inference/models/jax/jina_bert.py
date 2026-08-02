@@ -33,7 +33,6 @@ from typing import List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 from jax.sharding import Mesh
 from vllm.config import VllmConfig
@@ -42,7 +41,7 @@ from tpu_inference import utils
 from tpu_inference.layers.common.attention_interface import \
     encoder_only_attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
-from tpu_inference.layers.jax import JaxModule
+from tpu_inference.layers.jax import JaxModule, JaxModuleList
 from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear
 from tpu_inference.layers.jax.norm import JaxLayerNorm
@@ -174,9 +173,10 @@ class JinaBertSelfAttention(JaxModule):
         self.key = qkv("key")
         self.value = qkv("value")
 
-        # Constant per-head ALiBi slopes; numpy so it stays out of nnx state.
-        self.alibi_slopes = np.asarray(get_alibi_slopes(self.num_heads),
-                                       dtype=np.float32)
+        # Constant per-head ALiBi slopes; a plain tuple of floats so Flax
+        # treats it as static (arrays in static attributes are rejected by
+        # Flax >= 0.12 pytree checks).
+        self.alibi_slopes = tuple(get_alibi_slopes(self.num_heads))
 
     def __call__(self, x: jax.Array,
                  attention_metadata: AttentionMetadata) -> jax.Array:
@@ -190,7 +190,7 @@ class JinaBertSelfAttention(JaxModule):
             attention_metadata,
             self.mesh,
             sm_scale=self.head_dim_original**-0.5,
-            alibi_slopes=jnp.asarray(self.alibi_slopes),
+            alibi_slopes=jnp.asarray(self.alibi_slopes, dtype=jnp.float32),
         )
 
 
@@ -323,14 +323,16 @@ class JinaBertEncoder(JaxModule):
 
     def __init__(self, config, dtype: jnp.dtype, rng: nnx.Rngs, mesh: Mesh,
                  prefix: str):
-        self.layer = [
+        # nnx.List container: Flax >= 0.12 rejects plain Python lists of
+        # modules as pytree attributes.
+        self.layer = JaxModuleList([
             JinaBertLayer(config,
                           dtype,
                           rng,
                           mesh,
                           prefix=f"{prefix}.layer.{i}")
             for i in range(config.num_hidden_layers)
-        ]
+        ])
 
     def __call__(self, x: jax.Array,
                  attention_metadata: AttentionMetadata) -> jax.Array:
