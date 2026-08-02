@@ -57,8 +57,8 @@ def mesh():
         pytest.skip("No JAX devices available for mesh creation.")
     devices = np.array(jax.local_devices()[:1])
     device_mesh = devices.reshape((1, 1, 1, 1))
-    with Mesh(device_mesh,
-              axis_names=('data', 'attn_dp', 'expert', 'model')) as m:
+    m = Mesh(device_mesh, axis_names=('data', 'attn_dp', 'expert', 'model'))
+    with jax.set_mesh(m):
         yield m
 
 
@@ -132,9 +132,65 @@ class TestJinaBert:
         assert emb.word_embeddings.weight.shape == (hf_config.vocab_size,
                                                     hf_config.hidden_size)
 
+    @staticmethod
+    def _shim_removed_transformers_apis():
+        """The jina-bert-implementation remote code targets transformers 4.x;
+        provide in-process stand-ins for APIs removed in newer versions.
+        None of these are exercised at inference time."""
+        import sys
+        import types
+
+        import torch
+        import transformers
+
+        try:
+            import transformers.onnx  # noqa: F401
+        except Exception:
+            onnx_mod = types.ModuleType("transformers.onnx")
+
+            class OnnxConfig:  # only referenced for ONNX export
+                pass
+
+            onnx_mod.OnnxConfig = OnnxConfig
+            sys.modules["transformers.onnx"] = onnx_mod
+            transformers.onnx = onnx_mod
+
+        import transformers.pytorch_utils as pu
+        if not hasattr(pu, "find_pruneable_heads_and_indices"):
+
+            def find_pruneable_heads_and_indices(heads, n_heads, head_size,
+                                                 already_pruned_heads):
+                mask = torch.ones(n_heads, head_size)
+                heads = set(heads) - already_pruned_heads
+                for head in heads:
+                    head = head - sum(1 if h < head else 0
+                                      for h in already_pruned_heads)
+                    mask[head] = 0
+                mask = mask.view(-1).contiguous().eq(1)
+                index = torch.arange(len(mask))[mask].long()
+                return heads, index
+
+            pu.find_pruneable_heads_and_indices = \
+                find_pruneable_heads_and_indices
+        if not hasattr(pu, "prune_linear_layer"):
+
+            def prune_linear_layer(layer, index, dim=0):
+                raise NotImplementedError(
+                    "head pruning is not supported by this test shim")
+
+            pu.prune_linear_layer = prune_linear_layer
+        if not hasattr(pu, "apply_chunking_to_forward"):
+
+            def apply_chunking_to_forward(forward_fn, chunk_size, chunk_dim,
+                                          *input_tensors):
+                return forward_fn(*input_tensors)
+
+            pu.apply_chunking_to_forward = apply_chunking_to_forward
+
     def test_forward_and_hf_parity(self, mock_vllm_config, rng, mesh):
         torch = pytest.importorskip("torch")
         transformers = pytest.importorskip("transformers")
+        self._shim_removed_transformers_apis()
 
         # --- HF reference (CPU, float32) ---
         try:
