@@ -48,6 +48,7 @@ def test_jina_embeddings_e2e():
         llm = LLM(
             model=MODEL_ID,
             runner="pooling",
+            convert="embed",
             max_num_seqs=4,
             max_model_len=max_model_len,
             dtype="float32",
