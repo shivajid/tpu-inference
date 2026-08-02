@@ -209,7 +209,14 @@ class TestJinaBert:
         self._shim_removed_transformers_apis()
 
         # --- HF reference (CPU, float32) ---
+        # NOTE: from_pretrained is deliberately avoided — transformers v5's
+        # meta-device init breaks the old jina remote code (it materializes
+        # tensors like the alibi cache inside __init__). from_config does a
+        # plain CPU init; weights are then loaded manually from safetensors.
         try:
+            from huggingface_hub import hf_hub_download
+            from safetensors.torch import load_file
+
             tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_ID)
             hf_cfg = transformers.AutoConfig.from_pretrained(
                 MODEL_ID, trust_remote_code=True)
@@ -219,11 +226,23 @@ class TestJinaBert:
                         setattr(hf_cfg, attr, default)
                     except AttributeError:
                         pass  # read-only property
-            hf_model = transformers.AutoModel.from_pretrained(
-                MODEL_ID, config=hf_cfg, trust_remote_code=True,
-                dtype=torch.float32).eval()
+            hf_model = transformers.AutoModel.from_config(
+                hf_cfg, trust_remote_code=True)
+            ckpt_path = hf_hub_download(MODEL_ID, "model.safetensors")
         except Exception as e:
             pytest.skip(f"Could not download HF reference model: {e}")
+
+        state_dict = load_file(ckpt_path)
+        missing, unexpected = hf_model.load_state_dict(state_dict,
+                                                       strict=False)
+        assert not unexpected, f"unexpected checkpoint keys: {unexpected}"
+        # Buffers like token_type_ids may report missing; no params may.
+        missing_params = [
+            m for m in missing
+            if not m.endswith(("token_type_ids", "position_ids", "alibi"))
+        ]
+        assert not missing_params, f"missing params: {missing_params}"
+        hf_model = hf_model.float().eval()
 
         sentences = [
             "How is the weather today?",
