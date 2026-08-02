@@ -187,6 +187,22 @@ class TestJinaBert:
 
             pu.apply_chunking_to_forward = apply_chunking_to_forward
 
+    # PretrainedConfig defaults that transformers 4.x provided implicitly and
+    # v5 removed; the jina remote code still reads them.
+    _CONFIG_DEFAULTS = {
+        "is_decoder": False,
+        "add_cross_attention": False,
+        "is_encoder_decoder": False,
+        "chunk_size_feed_forward": 0,
+        "output_attentions": False,
+        "output_hidden_states": False,
+        "return_dict": True,
+        "use_return_dict": True,
+        "pruned_heads": {},
+        "tie_word_embeddings": True,
+        "torchscript": False,
+    }
+
     def test_forward_and_hf_parity(self, mock_vllm_config, rng, mesh):
         torch = pytest.importorskip("torch")
         transformers = pytest.importorskip("transformers")
@@ -195,9 +211,17 @@ class TestJinaBert:
         # --- HF reference (CPU, float32) ---
         try:
             tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_ID)
+            hf_cfg = transformers.AutoConfig.from_pretrained(
+                MODEL_ID, trust_remote_code=True)
+            for attr, default in self._CONFIG_DEFAULTS.items():
+                if not hasattr(hf_cfg, attr):
+                    try:
+                        setattr(hf_cfg, attr, default)
+                    except AttributeError:
+                        pass  # read-only property
             hf_model = transformers.AutoModel.from_pretrained(
-                MODEL_ID, trust_remote_code=True,
-                torch_dtype=torch.float32).eval()
+                MODEL_ID, config=hf_cfg, trust_remote_code=True,
+                dtype=torch.float32).eval()
         except Exception as e:
             pytest.skip(f"Could not download HF reference model: {e}")
 
