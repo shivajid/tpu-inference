@@ -13,11 +13,18 @@
 # limitations under the License.
 """Tests for the JAX-native JinaBert embedding model.
 
-Includes a numerical parity test against the HF `transformers` reference
-implementation (trust_remote_code) — cosine similarity of per-token hidden
-states and mean-pooled embeddings must exceed 0.999 in float32.
+Numerical parity is checked against the official ONNX export shipped in the
+model repo (same weights, float32, no remote code) — cosine similarity of
+per-token hidden states and mean-pooled embeddings must exceed 0.999.
+
+NOTE: the HF `transformers` remote-code reference (jina-bert-implementation)
+targets transformers 4.x and no longer loads under v5 (removed
+transformers.onnx / pytorch_utils APIs, meta-device init), which is why the
+ONNX export is used as the reference instead.
 """
 
+import sys
+import types
 from unittest.mock import MagicMock
 
 import jax
@@ -34,6 +41,25 @@ from tpu_inference.models.jax.jina_bert import (JinaBertForMaskedLM,
                                                 get_alibi_slopes)
 
 MODEL_ID = "jinaai/jina-embeddings-v2-small-en"
+
+
+def _shim_transformers_onnx_module():
+    """The jina remote-code *config* (configuration_bert.py) does
+    `from transformers.onnx import OnnxConfig`; that module was removed in
+    newer transformers. Provide an in-process stub (only referenced for ONNX
+    export, never executed)."""
+    import transformers
+    try:
+        import transformers.onnx  # noqa: F401
+    except Exception:
+        onnx_mod = types.ModuleType("transformers.onnx")
+
+        class OnnxConfig:
+            pass
+
+        onnx_mod.OnnxConfig = OnnxConfig
+        sys.modules["transformers.onnx"] = onnx_mod
+        transformers.onnx = onnx_mod
 
 
 class MockVllmConfig:
@@ -69,6 +95,7 @@ def rng() -> PRNGKey:
 
 @pytest.fixture(scope="module")
 def mock_vllm_config():
+    _shim_transformers_onnx_module()
     # Register the arch with vLLM's registry first (normally done by the
     # vllm.general_plugins entrypoint).
     from tpu_inference.models.vllm.experimental import register_models
@@ -132,127 +159,36 @@ class TestJinaBert:
         assert emb.word_embeddings.weight.shape == (hf_config.vocab_size,
                                                     hf_config.hidden_size)
 
-    @staticmethod
-    def _shim_removed_transformers_apis():
-        """The jina-bert-implementation remote code targets transformers 4.x;
-        provide in-process stand-ins for APIs removed in newer versions.
-        None of these are exercised at inference time."""
-        import sys
-        import types
-
-        import torch
-        import transformers
-
-        try:
-            import transformers.onnx  # noqa: F401
-        except Exception:
-            onnx_mod = types.ModuleType("transformers.onnx")
-
-            class OnnxConfig:  # only referenced for ONNX export
-                pass
-
-            onnx_mod.OnnxConfig = OnnxConfig
-            sys.modules["transformers.onnx"] = onnx_mod
-            transformers.onnx = onnx_mod
-
-        import transformers.pytorch_utils as pu
-        if not hasattr(pu, "find_pruneable_heads_and_indices"):
-
-            def find_pruneable_heads_and_indices(heads, n_heads, head_size,
-                                                 already_pruned_heads):
-                mask = torch.ones(n_heads, head_size)
-                heads = set(heads) - already_pruned_heads
-                for head in heads:
-                    head = head - sum(1 if h < head else 0
-                                      for h in already_pruned_heads)
-                    mask[head] = 0
-                mask = mask.view(-1).contiguous().eq(1)
-                index = torch.arange(len(mask))[mask].long()
-                return heads, index
-
-            pu.find_pruneable_heads_and_indices = \
-                find_pruneable_heads_and_indices
-        if not hasattr(pu, "prune_linear_layer"):
-
-            def prune_linear_layer(layer, index, dim=0):
-                raise NotImplementedError(
-                    "head pruning is not supported by this test shim")
-
-            pu.prune_linear_layer = prune_linear_layer
-        if not hasattr(pu, "apply_chunking_to_forward"):
-
-            def apply_chunking_to_forward(forward_fn, chunk_size, chunk_dim,
-                                          *input_tensors):
-                return forward_fn(*input_tensors)
-
-            pu.apply_chunking_to_forward = apply_chunking_to_forward
-
-    # PretrainedConfig defaults that transformers 4.x provided implicitly and
-    # v5 removed; the jina remote code still reads them.
-    _CONFIG_DEFAULTS = {
-        "is_decoder": False,
-        "add_cross_attention": False,
-        "is_encoder_decoder": False,
-        "chunk_size_feed_forward": 0,
-        "output_attentions": False,
-        "output_hidden_states": False,
-        "return_dict": True,
-        "use_return_dict": True,
-        "pruned_heads": {},
-        "tie_word_embeddings": True,
-        "torchscript": False,
-    }
-
-    def test_forward_and_hf_parity(self, mock_vllm_config, rng, mesh):
-        torch = pytest.importorskip("torch")
+    def test_forward_and_onnx_parity(self, mock_vllm_config, rng, mesh):
+        ort = pytest.importorskip("onnxruntime")
         transformers = pytest.importorskip("transformers")
-        self._shim_removed_transformers_apis()
 
-        # --- HF reference (CPU, float32) ---
-        # NOTE: from_pretrained is deliberately avoided — transformers v5's
-        # meta-device init breaks the old jina remote code (it materializes
-        # tensors like the alibi cache inside __init__). from_config does a
-        # plain CPU init; weights are then loaded manually from safetensors.
+        # --- Reference: official ONNX export from the model repo (fp32) ---
         try:
             from huggingface_hub import hf_hub_download
-            from safetensors.torch import load_file
-
             tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_ID)
-            hf_cfg = transformers.AutoConfig.from_pretrained(
-                MODEL_ID, trust_remote_code=True)
-            for attr, default in self._CONFIG_DEFAULTS.items():
-                if not hasattr(hf_cfg, attr):
-                    try:
-                        setattr(hf_cfg, attr, default)
-                    except AttributeError:
-                        pass  # read-only property
-            hf_model = transformers.AutoModel.from_config(
-                hf_cfg, trust_remote_code=True)
-            ckpt_path = hf_hub_download(MODEL_ID, "model.safetensors")
+            onnx_path = hf_hub_download(MODEL_ID, "model.onnx")
         except Exception as e:
-            pytest.skip(f"Could not download HF reference model: {e}")
+            pytest.skip(f"Could not download tokenizer/ONNX reference: {e}")
 
-        state_dict = load_file(ckpt_path)
-        missing, unexpected = hf_model.load_state_dict(state_dict,
-                                                       strict=False)
-        assert not unexpected, f"unexpected checkpoint keys: {unexpected}"
-        # Buffers like token_type_ids may report missing; no params may.
-        missing_params = [
-            m for m in missing
-            if not m.endswith(("token_type_ids", "position_ids", "alibi"))
-        ]
-        assert not missing_params, f"missing params: {missing_params}"
-        hf_model = hf_model.float().eval()
+        sess = ort.InferenceSession(onnx_path,
+                                    providers=["CPUExecutionProvider"])
+        input_names = {i.name for i in sess.get_inputs()}
 
         sentences = [
             "How is the weather today?",
             "Jina embeddings run on TPU v6e with vLLM.",
         ]
-        encoded = [tokenizer(s, return_tensors="pt") for s in sentences]
-        with torch.no_grad():
-            hf_hidden = [
-                hf_model(**e).last_hidden_state[0].numpy() for e in encoded
-            ]
+        encoded = [tokenizer(s, return_tensors="np") for s in sentences]
+        ref_hidden = []
+        for e in encoded:
+            feed = {
+                name: e[name].astype(np.int64)
+                for name in input_names if name in e
+            }
+            assert "input_ids" in feed, f"unexpected ONNX inputs {input_names}"
+            # last_hidden_state: [1, T, hidden]
+            ref_hidden.append(sess.run(None, feed)[0][0].astype(np.float32))
 
         # --- JAX model, same tokens as one concatenated ragged batch ---
         with jax.set_mesh(mesh):
@@ -261,9 +197,9 @@ class TestJinaBert:
             loader = get_model_loader(LoadConfig(load_format="hf"))
             loader.load_weights(model, mock_vllm_config.model_config)
 
-        seq_lens = [e.input_ids.shape[1] for e in encoded]
+        seq_lens = [int(e["input_ids"].shape[1]) for e in encoded]
         input_ids = jnp.array(
-            np.concatenate([e.input_ids[0].numpy() for e in encoded]),
+            np.concatenate([e["input_ids"][0] for e in encoded]),
             dtype=jnp.int32)
         metadata, total = _make_attention_metadata(seq_lens)
 
@@ -278,7 +214,7 @@ class TestJinaBert:
 
         hidden = np.asarray(hidden, dtype=np.float32)
         offset = 0
-        for ref, n in zip(hf_hidden, seq_lens):
+        for ref, n in zip(ref_hidden, seq_lens):
             got = hidden[offset:offset + n]
             offset += n
             # Per-token cosine similarity.
