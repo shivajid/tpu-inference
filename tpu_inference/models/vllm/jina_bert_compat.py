@@ -11,32 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""vLLM-registry compatibility wrapper for the JAX-native JinaBert model.
+"""vLLM-registry compatibility shim for the JAX-native JinaBert model.
 
 vLLM resolves architectures like "JinaBertForMaskedLM" through its own
 ModelRegistry at config time (to determine, among other things, that this is
 a pooling model). vLLM upstream has no JinaBert implementation, so we
-register this wrapper — it is never instantiated or executed by vLLM's
-PyTorch backend; the real model is the JAX implementation in
+register this shim. It is deliberately torch-only (no tpu_inference/JAX
+imports): the registry inspects it — possibly in a subprocess — but never
+instantiates or executes it. The real model is the JAX implementation in
 `tpu_inference.models.jax.jina_bert`, dispatched via tpu-inference's own
-registry. This mirrors what `model_loader.register_model` builds dynamically
-for out-of-tree models.
+registry.
 """
 
 from typing import Any, Optional
 
 import torch
 
-from tpu_inference.models.jax.jina_bert import \
-    JinaBertForMaskedLM as _JaxJinaBertForMaskedLM
 
-
-class JinaBertForMaskedLM(_JaxJinaBertForMaskedLM, torch.nn.Module):
+class JinaBertForMaskedLM(torch.nn.Module):
+    # Interface flags read by vLLM's registry inspection.
     is_pooling_model = True
+    default_pooling_type = "MEAN"
 
     def __init__(self, *args, **kwargs):
-        # Only torch.nn.Module init: this class exists purely to satisfy
-        # vLLM's registry inspection and must not trigger JAX logic.
         torch.nn.Module.__init__(self)
 
     def forward(
@@ -47,7 +44,8 @@ class JinaBertForMaskedLM(_JaxJinaBertForMaskedLM, torch.nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> None:
         raise NotImplementedError(
-            "This is a JAX model and does not implement the PyTorch forward.")
+            "JinaBert runs via the JAX backend; the PyTorch forward is a "
+            "registry-compatibility stub.")
 
     def embed_input_ids(
         self,
@@ -56,8 +54,9 @@ class JinaBertForMaskedLM(_JaxJinaBertForMaskedLM, torch.nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         raise NotImplementedError(
-            "This is a JAX model and does not implement embed_input_ids.")
+            "JinaBert runs via the JAX backend; embed_input_ids is a "
+            "registry-compatibility stub.")
 
     def load_weights(self, *args, **kwargs):
-        # Prevent vLLM from trying to load weights into this dummy class.
+        # Prevent vLLM from trying to load weights into this stub.
         return None
