@@ -488,7 +488,7 @@ def _flash_attention_kernel_single_batch(
                 # Symmetric encoder ALiBi computed per tile from block
                 # indices — bias = -slope_h * |row - col|, added to the
                 # already-scaled logits (matches the JinaBert reference).
-                slope = alibi_tile_ref[0, 0]
+                slope = alibi_tile_ref[0, 0, 0]
                 bias_shape = (block_q, block_k)
                 arow_ids = jax.lax.broadcasted_iota(jnp.int32, bias_shape, 0)
                 arow_ids += q_seq_idx * block_q
@@ -612,7 +612,7 @@ def _flash_attention_kernel_single_batch_single_step(
         # Symmetric encoder ALiBi, computed per tile from block indices.
         # Single-step: the kv block spans the full kv_seq_len, so the col
         # offset is 0; rows are offset by the q block index.
-        slope = alibi_tile_ref[0, 0]
+        slope = alibi_tile_ref[0, 0, 0]
         bias_shape = (block_q, block_k)
         arow_ids = jax.lax.broadcasted_iota(jnp.int32, bias_shape, 0)
         arow_ids += pl.program_id(2) * block_q
@@ -819,21 +819,24 @@ def _flash_attention_impl(
     alibi_operand = None
     alibi_spec = None
     if alibi_slopes is not None:
-        # Replicate each head's slope across one lane row so the kernel can
-        # block-fetch a [1, NUM_LANES] tile into VMEM and read the scalar.
-        # Total size is num_heads * NUM_LANES floats — negligible. The bias
-        # itself is computed inside the kernel per [block_q, block_k] tile
-        # from block indices, so no O(T^2) tensor is ever materialized.
+        # Replicate each head's slope across a full [NUM_SUBLANES, NUM_LANES]
+        # tile so the per-head block satisfies Mosaic's block-shape rule (last
+        # two dims must equal the array dims or be multiples of 8/128) — same
+        # pattern as the kv segment-ID operand. Total size is
+        # num_heads * 8 * 128 floats — negligible. The bias itself is computed
+        # inside the kernel per [block_q, block_k] tile from block indices, so
+        # no O(T^2) tensor is ever materialized.
         alibi_operand = jnp.broadcast_to(
-            alibi_slopes.astype(jnp.float32)[:, None],
-            (num_heads, NUM_LANES))
+            alibi_slopes.astype(jnp.float32)[:, None, None],
+            (num_heads, NUM_SUBLANES, NUM_LANES))
 
         def alibi_index_map(batch_index, head_index, q_seq_index,
                             kv_seq_index):
             del batch_index, q_seq_index, kv_seq_index
-            return (head_index, 0)
+            return (head_index, 0, 0)
 
-        alibi_spec = pl.BlockSpec((1, NUM_LANES), alibi_index_map)
+        alibi_spec = pl.BlockSpec((1, NUM_SUBLANES, NUM_LANES),
+                                  alibi_index_map)
 
     q_segment_ids_spec = kv_segment_ids_spec = None
     q_segment_ids = kv_segment_ids = None
