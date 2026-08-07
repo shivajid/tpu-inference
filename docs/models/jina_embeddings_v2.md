@@ -2,15 +2,18 @@
 
 Runbook for bringing up `jinaai/jina-embeddings-v2-small-en` — a JAX-native
 encoder-only embedding model (symmetric ALiBi, GEGLU, post-LayerNorm) — on a
-fresh TPU VM (validated on v6e, TP=1). The model runs under vLLM's pooling
-runner with no KV cache; mean pooling executes in vLLM's CPU pooler.
+fresh TPU VM (validated on v6e, TP=1, full 8192-token context). The model
+runs under vLLM's pooling runner with no KV cache; mean pooling executes in
+vLLM's CPU pooler. The symmetric ALiBi bias is computed inside the
+flash-attention kernel (`docs/developer_guides/encoder_alibi_kernel.md`), so
+long context costs no extra HBM.
 
 ## 1. Code
 
 ```bash
 git clone https://github.com/shivajid/tpu-inference.git
 cd tpu-inference
-git checkout jina-v2-embeddings-clean
+git checkout jina-v2-alibi-kernel
 ```
 
 ## 2. Python environment (uv, python 3.12)
@@ -60,6 +63,7 @@ process — needed because the API-server process validates ModelConfig before
 ## 5. Validate
 
 ```bash
+pytest tests/kernels/encoder_alibi_kernel_test.py -v  # ALiBi kernel vs dense reference; expect 5 passed
 pytest tests/models/jax/test_jina_bert.py -v -rs   # parity vs official ONNX export; expect 3 passed
 pytest tests/e2e/test_jina_embeddings.py -v -rs    # full engine path
 ```
@@ -76,9 +80,15 @@ vllm serve jinaai/jina-embeddings-v2-small-en --runner pooling --convert embed \
   --dtype float32
 ```
 
-`--max-num-batched-tokens` must be >= `max_model_len`: pooling models cannot
-chunk prefill, so the whole prompt has to fit in one scheduling step (it also
-drives the runner's precompiled shape buckets).
+`--max-num-batched-tokens` must be >= `max_model_len` and is **required**
+for prompts longer than the 2048 default. Two reasons: (1) pooling models
+cannot chunk prefill — an encoder has no KV cache and every token attends to
+the full sequence in a single pass, so the whole prompt must fit in one
+scheduling step's token budget; (2) the runner derives its precompiled shape
+buckets from this value, so shapes above it are never compiled. Setting both
+flags to 8192 also lets several short requests batch into one forward pass
+(e.g. four 2000-token documents in a single step), which is the main
+embedding-throughput lever.
 
 `--convert embed` is required: vLLM classifies the `JinaBertForMaskedLM`
 architecture string as masked-LM and gates the embeddings API otherwise. No
@@ -93,6 +103,22 @@ curl localhost:8000/v1/embeddings -H 'Content-Type: application/json' \
 ```
 
 Expect a 512-dimensional embedding.
+
+Long-context smoke test (~6300 tokens, exercises the >2048 path):
+
+```bash
+python3 - <<'PY'
+import json, urllib.request
+text = "the quick brown fox jumps over the lazy dog " * 700
+req = urllib.request.Request(
+    "http://localhost:8000/v1/embeddings",
+    json.dumps({"model": "jinaai/jina-embeddings-v2-small-en",
+                "input": text}).encode(),
+    {"Content-Type": "application/json"})
+r = json.load(urllib.request.urlopen(req))
+print("dims:", len(r["data"][0]["embedding"]), "| usage:", r["usage"])
+PY
+```
 
 ## Known limitations / follow-ups
 
