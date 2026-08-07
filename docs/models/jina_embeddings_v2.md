@@ -96,11 +96,12 @@ Expect a 512-dimensional embedding.
 
 ## Known limitations / follow-ups
 
-- Full 8192 context supported: the symmetric ALiBi bias is computed inside
-  the flash-attention kernel per tile from the [num_heads] slopes — no
-  O(heads × T²) tensor is materialized
-  (`tests/kernels/encoder_alibi_kernel_test.py` covers parity vs a dense
-  reference on both kernel paths).
+- Full 8192 context supported (validated on v6e): the symmetric ALiBi bias
+  is computed inside the flash-attention kernel per tile from the
+  [num_heads] slopes — no O(heads × T²) tensor is materialized. Design and
+  validation methodology:
+  `docs/developer_guides/encoder_alibi_kernel.md`; kernel tests:
+  `tests/kernels/encoder_alibi_kernel_test.py`.
 - float32 only (validated); bf16 pending validation against the fp32 baseline.
 - TP=1 (model is ~33M params); slopes already shard with heads for TP > 1.
 - The sitecustomize hook is a workaround; an upstream vLLM registration hook
