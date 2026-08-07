@@ -85,6 +85,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.llama4 import Llama4ForCausalLM
     from tpu_inference.models.jax.llama_eagle3 import EagleLlama3ForCausalLM
     from tpu_inference.models.jax.llama_guard_4 import LlamaGuard4ForCausalLM
+    from tpu_inference.models.jax.jina_bert import JinaBertForMaskedLM
     from tpu_inference.models.jax.qwen2 import Qwen2ForCausalLM
     from tpu_inference.models.jax.qwen2_5_vl import \
         Qwen2_5_VLForConditionalGeneration
@@ -105,6 +106,10 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY["Gemma4MTPModel"] = Gemma4MTPForCausalLM
     _MODEL_REGISTRY["DFlashForCausalLM"] = DFlashForCausalLM
     _MODEL_REGISTRY["DFlashDraftModel"] = DFlashForCausalLM
+    # Encoder-only embedding model (runner="pooling"); "JinaBertModel" is the
+    # arch string when the checkpoint is exported without the MLM head.
+    _MODEL_REGISTRY["JinaBertForMaskedLM"] = JinaBertForMaskedLM
+    _MODEL_REGISTRY["JinaBertModel"] = JinaBertForMaskedLM
 
     architectures = getattr(config, "architectures", [])
     for arch in architectures:
@@ -192,7 +197,7 @@ def _get_nnx_model(
                 mesh,
                 apply_to_abstract_model=True)
 
-            model = nnx.eval_shape(abstract_model_fn, graph_updates=False)
+            model = _nnx_eval_shape(abstract_model_fn)
             quantization_config = vllm_config.model_config.hf_config.quantization_config if hasattr(
                 vllm_config.model_config.hf_config,
                 "quantization_config") else {}
@@ -268,7 +273,7 @@ def _get_nnx_model(
                 mesh,
                 apply_to_abstract_model=True)
         with jax.set_mesh(mesh):
-            model = nnx.eval_shape(abstract_model_fn, graph_updates=False)
+            model = _nnx_eval_shape(abstract_model_fn)
         # Although the created model can already work, we still need to jit
         # the model creation again, otherwise the model forward will have
         # non-trivial overhead in PjitFunction.
@@ -306,6 +311,18 @@ def _get_nnx_model(
                 model,
                 use_qwix_on_abstract_model=should_apply_qwix_on_abstract_model)
     return jit_model
+
+
+def _nnx_eval_shape(abstract_model_fn) -> nnx.Module:
+    """nnx.eval_shape with flax-version compatibility.
+
+    Older flax versions require graph_updates=False here; newer ones removed
+    the kwarg (and would forward it to the model factory, raising TypeError).
+    """
+    try:
+        return nnx.eval_shape(abstract_model_fn, graph_updates=False)
+    except TypeError:
+        return nnx.eval_shape(abstract_model_fn)
 
 
 def _not_support(*args, **kwargs):
