@@ -101,6 +101,10 @@ def _register_vllm_compat_archs():
             "tpu_inference.models.vllm.jina_bert_compat:JinaBertForMaskedLM",
             "JinaBertModel":
             "tpu_inference.models.vllm.jina_bert_compat:JinaBertForMaskedLM",
+            "ElectraForPreTraining":
+            "tpu_inference.models.vllm.electra_compat:ElectraForPreTraining",
+            "ElectraModel":
+            "tpu_inference.models.vllm.electra_compat:ElectraForPreTraining",
         }
         existing = set(ModelRegistry.get_supported_archs())
         for arch, qualname in compat_archs.items():

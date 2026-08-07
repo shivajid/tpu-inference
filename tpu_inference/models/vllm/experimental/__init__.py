@@ -25,6 +25,10 @@ _TPU_VLLM_MODELS = {
     "tpu_inference.models.vllm.jina_bert_compat:JinaBertForMaskedLM",
     "JinaBertModel":
     "tpu_inference.models.vllm.jina_bert_compat:JinaBertForMaskedLM",
+    "ElectraForPreTraining":
+    "tpu_inference.models.vllm.electra_compat:ElectraForPreTraining",
+    "ElectraModel":
+    "tpu_inference.models.vllm.electra_compat:ElectraForPreTraining",
 }
 
 

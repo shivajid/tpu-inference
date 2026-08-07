@@ -86,6 +86,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.llama_eagle3 import EagleLlama3ForCausalLM
     from tpu_inference.models.jax.llama_guard_4 import LlamaGuard4ForCausalLM
     from tpu_inference.models.jax.jina_bert import JinaBertForMaskedLM
+    from tpu_inference.models.jax.electra import ElectraForPreTraining
     from tpu_inference.models.jax.qwen2 import Qwen2ForCausalLM
     from tpu_inference.models.jax.qwen2_5_vl import \
         Qwen2_5_VLForConditionalGeneration
@@ -110,6 +111,10 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     # arch string when the checkpoint is exported without the MLM head.
     _MODEL_REGISTRY["JinaBertForMaskedLM"] = JinaBertForMaskedLM
     _MODEL_REGISTRY["JinaBertModel"] = JinaBertForMaskedLM
+    # ELECTRA discriminator encoder (runner="pooling"); "ElectraModel" is
+    # the arch string when the checkpoint is exported without the RTD head.
+    _MODEL_REGISTRY["ElectraForPreTraining"] = ElectraForPreTraining
+    _MODEL_REGISTRY["ElectraModel"] = ElectraForPreTraining
 
     architectures = getattr(config, "architectures", [])
     for arch in architectures:
