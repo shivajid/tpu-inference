@@ -72,8 +72,13 @@ remote code) and requires cosine similarity > 0.999.
 
 ```bash
 vllm serve jinaai/jina-embeddings-v2-small-en --runner pooling --convert embed \
-  --trust-remote-code --max-model-len 1024 --dtype float32
+  --trust-remote-code --max-model-len 8192 --max-num-batched-tokens 8192 \
+  --dtype float32
 ```
+
+`--max-num-batched-tokens` must be >= `max_model_len`: pooling models cannot
+chunk prefill, so the whole prompt has to fit in one scheduling step (it also
+drives the runner's precompiled shape buckets).
 
 `--convert embed` is required: vLLM classifies the `JinaBertForMaskedLM`
 architecture string as masked-LM and gates the embeddings API otherwise. No
@@ -91,8 +96,11 @@ Expect a 512-dimensional embedding.
 
 ## Known limitations / follow-ups
 
-- `max_model_len` capped at 1024–2048 for now: the dense ALiBi bias tensor is
-  O(heads × T²); the full 8192 context wants kernel-side bias computation.
+- Full 8192 context supported: the symmetric ALiBi bias is computed inside
+  the flash-attention kernel per tile from the [num_heads] slopes — no
+  O(heads × T²) tensor is materialized
+  (`tests/kernels/encoder_alibi_kernel_test.py` covers parity vs a dense
+  reference on both kernel paths).
 - float32 only (validated); bf16 pending validation against the fp32 baseline.
 - TP=1 (model is ~33M params); slopes already shard with heads for TP > 1.
 - The sitecustomize hook is a workaround; an upstream vLLM registration hook

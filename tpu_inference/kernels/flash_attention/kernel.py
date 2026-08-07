@@ -161,38 +161,29 @@ def encoder_only_flash_attention(
         )
         return segment_ids
 
-    if sliding_window is not None or alibi_slopes is not None:
+    if sliding_window is not None:
         row_ids = jnp.arange(padded_len_q)[:, None]
         col_ids = jnp.arange(padded_len_kv)[None, :]
-        distance = jnp.abs(row_ids - col_ids)
-    if sliding_window is not None and alibi_slopes is None:
-        mask = distance <= sliding_window
+        mask = jnp.abs(row_ids - col_ids) <= sliding_window
         ab = jnp.where(mask, 0.0, -1e4).astype(q_bhtd.dtype)
         ab = jnp.expand_dims(ab, axis=(0, 1))
         ab = jnp.tile(ab, (1, num_heads, 1, 1))
-    elif alibi_slopes is not None:
-        # Symmetric (encoder) ALiBi: bias[h, i, j] = -slope_h * |i - j|.
-        # Cross-sequence pairs in the concatenated ragged batch are masked by
-        # segment IDs inside the kernel, so the global |i - j| formulation is
-        # correct per sequence. NOTE: the kernel adds `ab` to the raw q·k
-        # logits BEFORE multiplying by sm_scale, while the ALiBi reference
-        # adds the bias to the already-scaled logits — so pre-divide by
-        # sm_scale here. Kept in float32 for numerical parity.
-        alibi = -alibi_slopes.astype(jnp.float32)[:, None, None] * (
-            distance.astype(jnp.float32)[None, :, :] / sm_scale)
-        ab = jnp.expand_dims(alibi, axis=0)  # [1, num_heads, Tq, Tkv]
-        if sliding_window is not None:
-            window_bias = jnp.where(distance <= sliding_window, 0.0, -1e4)
-            ab = ab + window_bias[None, None, :, :]
     else:
         ab = None
 
+    # Symmetric (encoder) ALiBi is NOT materialized as a dense [H, T, T]
+    # bias here (that is O(heads * T^2) HBM and OOMs at long context).
+    # Instead the [num_heads] slopes are forwarded to the kernel, which
+    # computes the per-tile bias inline from block indices. Cross-sequence
+    # pairs in the concatenated ragged batch are masked by segment IDs, so
+    # the global |i - j| formulation is correct per sequence.
     output_bhtd = flash_attention(
         q_bhtd,
         k_bhtd,
         v_bhtd,
         ab,
         build_segment_ids(),
+        alibi_slopes=alibi_slopes,
         causal=causal,
         sm_scale=sm_scale,
         block_sizes=block_sizes,
@@ -282,6 +273,7 @@ def flash_attention(
     v,  # [batch_size, num_heads, kv_seq_len, d_model]
     ab=None,  # [batch_size, num_heads, q_seq_len, kv_seq_len]
     segment_ids=None,  # q of [batch_size, q_seq_len] and kv of [batch_size, kv_seq_len]
+    alibi_slopes=None,  # [num_heads] — symmetric ALiBi, computed in-kernel
     *,
     causal: bool = False,
     sm_scale: float = 1.0,
@@ -316,6 +308,11 @@ def flash_attention(
             raise ValueError(
                 f"Attention bias shape mismatch: expected ({batch_size=},"
                 f" {num_heads=}, {q_seq_len=}, {kv_seq_len=}), got {ab.shape}")
+    if alibi_slopes is not None:
+        if alibi_slopes.shape != (num_heads, ):
+            raise ValueError(
+                f"ALiBi slopes shape mismatch: expected ({num_heads=},), got"
+                f" {alibi_slopes.shape}")
     if segment_ids is not None:
         if segment_ids.q.shape != (batch_size, q_seq_len):
             raise ValueError(
@@ -357,8 +354,9 @@ def flash_attention(
                                          block_b=block_sizes.block_b,
                                          block_k_major=kv_seq_len,
                                          block_k=kv_seq_len)
-    return _flash_attention(q, k, v, ab, segment_ids, False, causal, sm_scale,
-                            block_sizes, vmem_limit_bytes, debug)
+    return _flash_attention(q, k, v, ab, segment_ids, alibi_slopes, False,
+                            causal, sm_scale, block_sizes, vmem_limit_bytes,
+                            debug)
 
 
 def _flash_attention(
@@ -367,6 +365,7 @@ def _flash_attention(
     v,
     ab,
     segment_ids,
+    alibi_slopes,
     save_residuals,
     causal,
     sm_scale,
@@ -380,6 +379,7 @@ def _flash_attention(
         v,
         ab,
         segment_ids,
+        alibi_slopes,
         save_residuals,
         causal,
         sm_scale,
@@ -420,7 +420,8 @@ def _flash_attention_kernel_single_batch(
     v_tile_ref,
     ab_tile_ref,
     q_segment_ids_tile_ref,
-    kv_segment_ids_tile_ref,  # Input arrays
+    kv_segment_ids_tile_ref,
+    alibi_tile_ref,  # Input arrays
     o_tile_ref,  # Output arrays
     l_ref,
     m_ref,
@@ -482,6 +483,19 @@ def _flash_attention_kernel_single_batch(
 
             if sm_scale != 1.0:
                 s *= sm_scale
+
+            if alibi_tile_ref is not None:
+                # Symmetric encoder ALiBi computed per tile from block
+                # indices — bias = -slope_h * |row - col|, added to the
+                # already-scaled logits (matches the JinaBert reference).
+                slope = alibi_tile_ref[0, 0]
+                bias_shape = (block_q, block_k)
+                arow_ids = jax.lax.broadcasted_iota(jnp.int32, bias_shape, 0)
+                arow_ids += q_seq_idx * block_q
+                acol_ids = jax.lax.broadcasted_iota(jnp.int32, bias_shape, 1)
+                acol_ids += kv_seq_idx * block_k_major + start_k
+                distance = jnp.abs(arow_ids - acol_ids).astype(jnp.float32)
+                s -= slope * distance
 
             mask = None
             if q_segment_ids_tile_ref is not None:
@@ -566,7 +580,8 @@ def _flash_attention_kernel_single_batch_single_step(
     v_tile_ref,
     ab_tile_ref,
     q_segment_ids_tile_ref,
-    kv_segment_ids_tile_ref,  # Input arrays
+    kv_segment_ids_tile_ref,
+    alibi_tile_ref,  # Input arrays
     o_tile_ref,  # Output arrays
     l_ref: Any | None = None,
     m_ref: Any | None = None,
@@ -592,6 +607,18 @@ def _flash_attention_kernel_single_batch_single_step(
         s += ab_tile_ref[batch_idx].astype(jnp.float32)
     if sm_scale != 1.0:
         s *= sm_scale
+
+    if alibi_tile_ref is not None:
+        # Symmetric encoder ALiBi, computed per tile from block indices.
+        # Single-step: the kv block spans the full kv_seq_len, so the col
+        # offset is 0; rows are offset by the q block index.
+        slope = alibi_tile_ref[0, 0]
+        bias_shape = (block_q, block_k)
+        arow_ids = jax.lax.broadcasted_iota(jnp.int32, bias_shape, 0)
+        arow_ids += pl.program_id(2) * block_q
+        acol_ids = jax.lax.broadcasted_iota(jnp.int32, bias_shape, 1)
+        distance = jnp.abs(arow_ids - acol_ids).astype(jnp.float32)
+        s -= slope * distance
 
     mask = None
     if q_segment_ids_tile_ref is not None:
@@ -674,6 +701,7 @@ def _flash_attention_impl(
     v,
     ab,
     segment_ids,
+    alibi_slopes,
     save_residuals,
     causal,
     sm_scale,
@@ -788,6 +816,25 @@ def _flash_attention_impl(
         (block_b, 1, block_q,
          block_k_major), ab_index_map) if ab is not None else None)
 
+    alibi_operand = None
+    alibi_spec = None
+    if alibi_slopes is not None:
+        # Replicate each head's slope across one lane row so the kernel can
+        # block-fetch a [1, NUM_LANES] tile into VMEM and read the scalar.
+        # Total size is num_heads * NUM_LANES floats — negligible. The bias
+        # itself is computed inside the kernel per [block_q, block_k] tile
+        # from block indices, so no O(T^2) tensor is ever materialized.
+        alibi_operand = jnp.broadcast_to(
+            alibi_slopes.astype(jnp.float32)[:, None],
+            (num_heads, NUM_LANES))
+
+        def alibi_index_map(batch_index, head_index, q_seq_index,
+                            kv_seq_index):
+            del batch_index, q_seq_index, kv_seq_index
+            return (head_index, 0)
+
+        alibi_spec = pl.BlockSpec((1, NUM_LANES), alibi_index_map)
+
     q_segment_ids_spec = kv_segment_ids_spec = None
     q_segment_ids = kv_segment_ids = None
     if segment_ids is not None:
@@ -839,6 +886,7 @@ def _flash_attention_impl(
         ab_block_spec,
         q_segment_ids_spec,
         kv_segment_ids_spec,
+        alibi_spec,
     ]
 
     o, *aux = pl.pallas_call(
@@ -869,10 +917,11 @@ def _flash_attention_impl(
             segment_ids,
             causal=causal,
             sm_scale=sm_scale,
-            kernel_inputs_specs=(q, k, v, ab, q_segment_ids, kv_segment_ids),
+            kernel_inputs_specs=(q, k, v, ab, q_segment_ids, kv_segment_ids,
+                                 alibi_operand),
             kernel_outputs_specs=out_shape,
         ),
-    )(q, k, v, ab, q_segment_ids, kv_segment_ids)
+    )(q, k, v, ab, q_segment_ids, kv_segment_ids, alibi_operand)
     if save_residuals:
         l, m = (v[..., 0] for v in aux[-2:])
         return (o, l, m)
