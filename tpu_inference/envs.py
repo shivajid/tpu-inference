@@ -407,6 +407,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("VLLM_TPU_PATCH_MM_EMBEDDINGS", default=False),
     "DISABLE_MLA_Q_ACTIVATION_QUANTIZATION":
     env_bool("DISABLE_MLA_Q_ACTIVATION_QUANTIZATION", default=False),
+    # Disable GLM-5.2's DeepSeek Sparse Attention (lightning indexer) so the
+    # MLA backbone runs dense (full-context). Bring-up aid before the sparse
+    # top-k path is enabled on TPU.
+    "GLM_DSA_DISABLE":
+    env_bool("GLM_DSA_DISABLE", default=False),
     # Enable hierarchical reduce-scatter kernel for MoE
     "ENABLE_RS_KERNEL":
     env_bool("ENABLE_RS_KERNEL", default=False),

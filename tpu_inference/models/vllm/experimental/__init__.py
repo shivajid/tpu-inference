@@ -19,6 +19,11 @@
 _TPU_VLLM_MODELS = {
     "DeepseekV4ForCausalLM":
     "tpu_inference.models.vllm.experimental.deepseek_v4:DeepseekV4ForCausalLM",
+    # GLM-5.2 (zai-org/GLM-5.2): MoE + MLA + DeepSeek Sparse Attention.
+    # Subclasses upstream vLLM's GlmMoeDsaForCausalLM; the MLA attention is
+    # routed to the TPU PallasMLA backend by the register_oot MLA wrapper.
+    "GlmMoeDsaForCausalLM":
+    "tpu_inference.models.vllm.experimental.glm_moe_dsa:GlmMoeDsaForCausalLM",
 }
 
 
@@ -29,6 +34,18 @@ def register_models():
     startup, before any model is resolved from its architecture name.
     """
     from vllm import ModelRegistry
+    from vllm.model_executor.models.registry import _EMBEDDING_MODELS
 
     for arch, model_cls in _TPU_VLLM_MODELS.items():
         ModelRegistry.register_model(arch, model_cls)
+
+    # Register JAX pooling models for TPU inference
+    from tpu_inference.models.jax.jina_bert import (
+        JinaBertForMaskedLM,
+        JinaBertModel,
+    )
+    from tpu_inference.models.common.model_loader import register_model
+    register_model("JinaBertForMaskedLM", JinaBertModel)
+    register_model("JinaBertModel", JinaBertModel)
+    _EMBEDDING_MODELS["JinaBertForMaskedLM"] = ("jina", "JinaBertForMaskedLM")
+    _EMBEDDING_MODELS["JinaBertModel"] = ("jina", "JinaBertModel")
