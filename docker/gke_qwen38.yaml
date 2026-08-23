@@ -38,7 +38,10 @@ spec:
       hostIPC: true          # torchax/JAX use shared memory heavily
       containers:
         - name: vllm
-          image: europe-west4-docker.pkg.dev/northam-ce-mlai-tpu/qwen38-tpu/qwen38-tpu:v1
+          # v2-warmcache has the XLA compilation cache baked into the image
+          # (327 MB), so startup skips ~10-15 min of compilation; pods are
+          # typically ready in ~1-2 min once weights are available.
+          image: europe-west4-docker.pkg.dev/northam-ce-mlai-tpu/qwen38-tpu/qwen38-tpu:v2-warmcache
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
@@ -69,10 +72,10 @@ spec:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 120     # weight download + XLA compile
+            initialDelaySeconds: 60      # warm XLA cache; weight download dominates
             periodSeconds: 30
             timeoutSeconds: 10
-            failureThreshold: 40         # up to ~20 min to become ready
+            failureThreshold: 20         # ~10 min budget for first weight download
           livenessProbe:
             httpGet:
               path: /health
