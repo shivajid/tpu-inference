@@ -1,0 +1,110 @@
+# GKE manifests for serving Qwen/Qwen3.8-27B on a TPU v6e node pool.
+#
+# Prerequisites:
+#   * GKE cluster with a TPU v6e node pool (machine type ct6e-standard-4t,
+#     topology 1x4) and the TPU device plugin enabled.
+#   * The image pushed to a registry the nodes can pull from
+#     (here: europe-west4-docker.pkg.dev/northam-ce-mlai-tpu/qwen38-tpu/qwen38-tpu:v1).
+#
+# Notes:
+#   * privileged + hostPath /dev/vfio is the standard way to expose TPU chips
+#     to a container on GKE TPU nodes (same as upstream vLLM TPU examples).
+#   * HF weights (56 GB) are downloaded once per pod into an emptyDir with
+#     120 GB; for production, replace hf-cache with a GCSFuse or PD volume and
+#     pre-populate it to avoid per-pod downloads.
+#   * JAX compilation cache is kept on an emptyDir so pod restarts (same pod)
+#     skip the ~5-7 min XLA precompile; a new pod recompiles once.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen38-tpu
+  labels:
+    app: qwen38-tpu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qwen38-tpu
+  strategy:
+    type: Recreate          # TPU node: one pod at a time
+  template:
+    metadata:
+      labels:
+        app: qwen38-tpu
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 1x4
+      hostIPC: true          # torchax/JAX use shared memory heavily
+      containers:
+        - name: vllm
+          image: europe-west4-docker.pkg.dev/northam-ce-mlai-tpu/qwen38-tpu/qwen38-tpu:v1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: TENSOR_PARALLEL_SIZE
+              value: "4"
+            - name: MAX_MODEL_LEN
+              value: "32768"
+            - name: MAX_NUM_SEQS
+              value: "8"
+            - name: PORT
+              value: "8000"
+          resources:
+            limits:
+              google.com/tpu: "4"
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: vfio
+              mountPath: /dev/vfio
+            - name: shm
+              mountPath: /dev/shm
+            - name: hf-cache
+              mountPath: /hf_cache
+            - name: jax-cache
+              mountPath: /jax_cache
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120     # weight download + XLA compile
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 40         # up to ~20 min to become ready
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 300
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 5
+      volumes:
+        - name: vfio
+          hostPath:
+            path: /dev/vfio
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: hf-cache
+          emptyDir:
+            sizeLimit: 120Gi
+        - name: jax-cache
+          emptyDir:
+            sizeLimit: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen38-tpu
+spec:
+  selector:
+    app: qwen38-tpu
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+  type: ClusterIP
