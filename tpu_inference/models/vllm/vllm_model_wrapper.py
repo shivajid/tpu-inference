@@ -489,6 +489,16 @@ class VllmModelWrapper:
         """
         if not self.vllm_config.model_config.is_multimodal_model:
             return None
+        # In text-only mode (--language-model-only) the vision tower is replaced
+        # by a StageMissingLayer stub, so there is nothing to precompile and
+        # calling it would raise. Skip vision precompilation entirely.
+        mm_config = self.vllm_config.model_config.multimodal_config
+        if mm_config is not None and getattr(mm_config, "language_model_only",
+                                             False):
+            logger.info(
+                "Skipping vision encoder precompilation: language_model_only=True"
+            )
+            return None
         if self._mm_encoder_jit_manager is not None:
             return self._mm_encoder_jit_manager.precompile_vision_encoder
 
