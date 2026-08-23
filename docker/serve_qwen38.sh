@@ -30,7 +30,11 @@ export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/jax_cache}"
 # --- Model / server knobs ---
 MODEL="${MODEL:-Qwen/Qwen3.8-27B}"
 TP="${TENSOR_PARALLEL_SIZE:-4}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
+# 32k default is a practical production context. Only 16/64 layers are
+# full-attention, so KV-cache growth with length is modest; the 48 GDN layers
+# hold constant-size state. Model supports up to 262144 (raise MAX_MODEL_LEN
+# and/or lower MAX_NUM_SEQS if you have the HBM headroom).
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 GPU_MEM_UTIL="${GPU_MEMORY_UTILIZATION:-0.9}"
 PORT="${PORT:-8000}"
