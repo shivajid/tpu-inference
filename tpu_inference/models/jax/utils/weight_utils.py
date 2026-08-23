@@ -68,6 +68,10 @@ class MetadataMap:
     bias_reshape_map: dict[str, tuple[int, ...]] = field(default_factory=dict)
     pad_map: dict[str, tuple[int, ...]] = field(default_factory=dict)
     bias_pad_map: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    # Zero-padding (not jnp.repeat) for the vocab axis of embed_tokens/lm_head,
+    # keyed by weight-name substring -> (pad_dim, pad_size). Used by models
+    # whose vocab is not TP-divisible (e.g. Granite, vocab 49159).
+    vocab_pad_map: dict[str, tuple[int, ...]] = field(default_factory=dict)
 
 
 ############ START Used by llama4, deepseek only for now START ############
@@ -336,6 +340,7 @@ def _load_and_shard_weight(vllm_config,
     transpose_keys = metadata_map.transpose_map
     pad_keys = metadata_map.pad_map
     bias_pad_keys = metadata_map.bias_pad_map
+    vocab_pad_keys = getattr(metadata_map, "vocab_pad_map", {})
 
     shard = functools.partial(shard_put, mesh=mesh)
 
@@ -345,6 +350,16 @@ def _load_and_shard_weight(vllm_config,
     head_dim_original = model_config.get_head_size()
     head_dim = utils.get_padded_head_dim(head_dim_original)
     head_dim_pad = head_dim - head_dim_original
+
+    # Pad vocab for TP-divisibility (e.g. Granite vocab 49159 -> 49160/49152).
+    # vocab_pad_map may carry an entry keyed by weight-name substring whose
+    # value is (pad_dim, pad_size); these rows are zero and unreachable by the
+    # tokenizer. This is zero-padding, independent of the jnp.repeat pad_map.
+    vocab_pad = 0
+    for key, value in vocab_pad_keys.items():
+        if key in hf_key and value[1] != 0:
+            vocab_pad = value[1]
+            break
 
     # Check if the key should retain its original dtype
     keep_original_dtype = False
@@ -429,6 +444,9 @@ def _load_and_shard_weight(vllm_config,
             if key in hf_key:
                 hf_weight = jnp.transpose(hf_weight, transpose_keys[key])
                 break
+        # Zero-pad the vocab axis for embed_tokens / lm_head (TP-divisibility).
+        if vocab_pad > 0:
+            hf_weight = jnp.pad(hf_weight, ((0, vocab_pad), (0, 0)))
 
     # Pad num-kv-heads
     if hf_key.endswith(".bias"):
@@ -451,7 +469,7 @@ def _load_and_shard_weight(vllm_config,
         f"{hf_key}: {hf_weight.shape} --> {model_key}: {model_weight.get_value().shape} {model_sharding}"
     )
 
-    if head_dim_pad == 0:
+    if head_dim_pad == 0 and vocab_pad == 0:
         assert model_weight.get_value(
         ).shape == hf_weight.shape, f"{hf_key}: {model_weight.get_value().shape} != {hf_weight.shape}"
 

@@ -246,6 +246,19 @@ def get_padded_num_heads(num_heads: int, sharding_size: int) -> int:
     return num_heads
 
 
+def get_padded_vocab_size(vocab_size: int, divisor: int = 128) -> int:
+    """Pads vocab_size up to the nearest multiple of `divisor`.
+
+    The embedding / lm_head weight is sharded along the vocab axis across the
+    tensor-parallel mesh, so its size must be divisible by the TP degree. Some
+    models (e.g. Granite, vocab_size 49159) have a vocab that is not divisible
+    by common TP sizes; padding up to a 128 multiple keeps the weight
+    shardable and tile-aligned. Extra rows are zero-padded on load and never
+    produced by the tokenizer, so they are unreachable.
+    """
+    return (vocab_size + divisor - 1) // divisor * divisor
+
+
 def get_dtype_packing(dtype):
     bits = dtypes.itemsize_bits(dtype)
     return 32 // bits
