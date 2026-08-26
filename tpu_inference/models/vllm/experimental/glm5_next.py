@@ -520,4 +520,7 @@ class Glm5NextTextForCausalLM(nn.Module, SupportsPP):
             name = name.replace("self_attn.", "attn.")
         # MoE / MLP: mlp -> ffn.
         name = name.replace("mlp.", "ffn.")
+        # Decoder-layer norms use the DeepseekV4 attribute names in this port.
+        name = name.replace("input_layernorm.", "attn_norm.")
+        name = name.replace("post_attention_layernorm.", "ffn_norm.")
         return name
