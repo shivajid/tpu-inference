@@ -500,6 +500,13 @@ class Glm5NextTextForCausalLM(nn.Module, SupportsPP):
 
         # Fuse the KDA input projections in (q, k, v, f_a, g_a, b) order.
         params = dict(self.named_parameters())
+        if kda_in_proj:
+            sample = next(iter(kda_in_proj))
+            close = [n for n in params
+                     if "in_proj_qkvgfab" in n or "layers.0.attn." in n][:12]
+            logger.info(
+                "KDA fusion: %d in_proj bases, sample base=%r; closest "
+                "registered params=%s", len(kda_in_proj), sample, close)
         for base, shards in kda_in_proj.items():
             ordered = [shards[p] for p in in_proj_names if p in shards]
             fused = torch.cat(ordered, dim=0)
@@ -512,7 +519,7 @@ class Glm5NextTextForCausalLM(nn.Module, SupportsPP):
 
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=[
+            ignore_unexpected_prefixes=[
                 "model.visual.",
                 "visual.",
                 "model.layers.45.",
