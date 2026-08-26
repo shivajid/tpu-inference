@@ -491,13 +491,14 @@ class Glm5NextTextForCausalLM(nn.Module, SupportsPP):
             passthrough.append((tname, weight))
 
         params = dict(self.named_parameters())
+        shard_ids = {"gate": 0, "up": 1}
         for base, shards in gate_up.items():
             for shard in ("gate", "up"):
                 if shard in shards:
                     param = params[base]
                     loader_fn = getattr(param, "weight_loader",
                                         default_weight_loader)
-                    loader_fn(param, shards[shard], shard)
+                    loader_fn(param, shards[shard], shard_ids[shard])
                 scale_key = f"{shard}_scale"
                 if scale_key in shards:
                     # weight_scale_inv has no shard loader; both gate and up
