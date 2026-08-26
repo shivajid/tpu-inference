@@ -93,6 +93,10 @@ def _text_config(config):
     # config.rope_parameters["rope_type"]. Provide a default.
     if getattr(config, "rope_parameters", None) is None:
         config.rope_parameters = {"rope_type": "default"}
+    # DeepseekV4MoE reads config.num_hash_layers (a DeepSeek-V4 hash-MoE
+    # field); GLM-5.3 has no hash-MoE layers, so default to 0.
+    if getattr(config, "num_hash_layers", None) is None:
+        config.num_hash_layers = 0
     return config
 
 
