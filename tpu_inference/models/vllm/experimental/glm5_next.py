@@ -467,10 +467,44 @@ class Glm5NextTextForCausalLM(nn.Module, SupportsPP):
            ``shared_head.``, ``eh_proj``, ``enorm``, ``hnorm``) tensors.
         """
 
-        # The TPU KDA build keeps separate q/k/v/f_a/f_b/g_a/g_b/b_proj and
-        # q/k/v_conv1d whose names match the checkpoint after the prefix
-        # remap (self_attn -> attn), so no fusing is needed; we only rename
-        # and delegate to AutoWeightsLoader.
+        # Dense-MLP and MoE shared-experts fuse gate_proj+up_proj into
+        # gate_up_proj; the AutoWeightsLoader does not apply
+        # packed_modules_mapping for these, so we route them explicitly with
+        # shard ids. Everything else is name-translated and delegated.
+        gate_up: dict[str, dict[str, torch.Tensor]] = {}
+        passthrough: list[tuple[str, torch.Tensor]] = []
+        for name, weight in weights:
+            tname = self._translate_weight_name(name)
+            if tname is None:
+                continue
+            if ".gate_proj." in tname or ".up_proj." in tname:
+                # Skip MoE routed experts (mlp.experts.*) — FusedMoEFactory
+                # handles those; only fuse the dense MLP / shared experts.
+                if ".experts." not in tname:
+                    is_scale = tname.endswith("weight_scale_inv")
+                    base = tname.replace(".gate_proj.", ".gate_up_proj.") \
+                                .replace(".up_proj.", ".gate_up_proj.")
+                    shard = "gate" if ".gate_proj." in tname else "up"
+                    key = f"{shard}_scale" if is_scale else shard
+                    gate_up.setdefault(base, {})[key] = weight
+                    continue
+            passthrough.append((tname, weight))
+
+        params = dict(self.named_parameters())
+        for base, shards in gate_up.items():
+            for shard in ("gate", "up"):
+                if shard in shards:
+                    param = params[base]
+                    loader_fn = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                    loader_fn(param, shards[shard], shard)
+                scale_key = f"{shard}_scale"
+                if scale_key in shards:
+                    # weight_scale_inv has no shard loader; both gate and up
+                    # scale tensors land in the same fused scale buffer.
+                    scale_param = params[base]
+                    default_weight_loader(scale_param, shards[scale_key])
+
         loader = AutoWeightsLoader(
             self,
             ignore_unexpected_prefixes=[
@@ -479,11 +513,7 @@ class Glm5NextTextForCausalLM(nn.Module, SupportsPP):
                 "model.layers.45.",
             ],
         )
-        translated = (
-            (self._translate_weight_name(name), weight)
-            for name, weight in weights)
-        loader.load_weights(
-            (n, w) for n, w in translated if n is not None)
+        loader.load_weights(iter(passthrough))
 
     # ------------------------------------------------------------------
     # Weight-name translation (HF checkpoint -> this vLLM port)
