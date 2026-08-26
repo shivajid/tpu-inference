@@ -79,8 +79,20 @@ from tpu_inference.models.vllm.experimental.deepseek_v4 import (
 logger = init_logger(__name__)
 
 
+def _text_config(config):
+    """Unwrap the multimodal Glm5NextConfig to its text_config sub-config.
+
+    zai-org/GLM-5.3-Flash ships a multimodal config (``Glm5NextConfig``) whose
+    language-model params live under ``.text_config``; the text-only
+    ``Glm5NextTextConfig`` has them at top level. All blocks in this port need
+    the text config.
+    """
+    return getattr(config, "text_config", config)
+
+
 def _is_kda_layer(config, layer_idx: int) -> bool:
     """True if decoder layer `layer_idx` is a KDA linear-attention layer."""
+    config = _text_config(config)
     layer_types = getattr(config, "layer_types", None)
     if layer_types is None:
         # Fallback: full-attention layers listed in linear_attn_config.
@@ -120,7 +132,7 @@ class Glm5NextMLAAttention(nn.Module):
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        config = vllm_config.model_config.hf_config
+        config = _text_config(vllm_config.model_config.hf_config)
         self.layer_idx = extract_layer_index(prefix)
 
         self.mla = _UpstreamDeepseekV2MLAAttention(
@@ -178,17 +190,26 @@ class Glm5NextDecoderLayer(nn.Module):
         # Registers torch.ops.vllm.mhc_pre / mhc_post (lazy tilelang import).
         import vllm.model_executor.layers.mhc  # noqa: F401
 
-        config = vllm_config.model_config.hf_config
+        config = _text_config(vllm_config.model_config.hf_config)
         self.hidden_size = config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
         self.layer_idx = extract_layer_index(prefix)
 
+        # Sub-blocks (KDA attention, DeepseekV2MLAAttention, DeepseekV4MoE)
+        # read LM attrs from vllm_config.model_config.hf_config; expose the
+        # unwrapped text config to them via a shallow proxy.
+        import copy
+        sub_model_config = copy.copy(vllm_config.model_config)
+        sub_model_config.hf_config = config
+        sub_vllm_config = copy.copy(vllm_config)
+        sub_vllm_config.model_config = sub_model_config
+
         if _is_kda_layer(config, self.layer_idx):
             self.attn = Glm5NextKDAAttention(
-                config, vllm_config, prefix=f"{prefix}.attn")
+                config, sub_vllm_config, prefix=f"{prefix}.attn")
         else:
             self.attn = Glm5NextMLAAttention(
-                vllm_config, prefix=f"{prefix}.attn")
+                sub_vllm_config, prefix=f"{prefix}.attn")
 
         if self.layer_idx < config.first_k_dense_replace:
             self.ffn = DeepseekV4MLP(
@@ -200,7 +221,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 prefix=f"{prefix}.ffn",
             )
         else:
-            self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+            self.ffn = DeepseekV4MoE(sub_vllm_config, prefix=f"{prefix}.ffn")
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -296,7 +317,7 @@ class Glm5NextTextModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        config = vllm_config.model_config.hf_config
+        config = _text_config(vllm_config.model_config.hf_config)
         self.config = config
         self.vocab_size = config.vocab_size
         self.hc_mult = config.hc_mult
@@ -368,7 +389,7 @@ class Glm5NextTextForCausalLM(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        config = vllm_config.model_config.hf_config
+        config = _text_config(vllm_config.model_config.hf_config)
         self.config = config
         self.quant_config = vllm_config.quant_config
 
