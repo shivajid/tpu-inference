@@ -87,7 +87,13 @@ def _text_config(config):
     ``Glm5NextTextConfig`` has them at top level. All blocks in this port need
     the text config.
     """
-    return getattr(config, "text_config", config)
+    config = getattr(config, "text_config", config)
+    # GLM-5.3 uses pure-nope MLA (qk_rope_head_dim=0) with no rope config, but
+    # vLLM's DeepseekV2MLAAttention unconditionally reads
+    # config.rope_parameters["rope_type"]. Provide a default.
+    if getattr(config, "rope_parameters", None) is None:
+        config.rope_parameters = {"rope_type": "default"}
+    return config
 
 
 def _is_kda_layer(config, layer_idx: int) -> bool:
