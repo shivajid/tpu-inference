@@ -29,6 +29,10 @@ _TPU_VLLM_MODELS = {
     # bring-up; the multimodal wrapper is a follow-up.
     "Glm5NextTextForCausalLM":
     "tpu_inference.models.vllm.experimental.glm5_next:Glm5NextTextForCausalLM",
+    # The HF checkpoint advertises the multimodal wrapper architecture; map
+    # it to the same text-only bring-up (vision tower not yet on TPU).
+    "Glm5NextForConditionalGeneration":
+    "tpu_inference.models.vllm.experimental.glm5_next:Glm5NextTextForCausalLM",
 }
 
 
