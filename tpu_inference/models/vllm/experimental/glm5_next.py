@@ -305,8 +305,8 @@ class Glm5NextDecoderLayer(nn.Module):
         if isinstance(self.attn, Glm5NextMLAAttention):
             x = self.attn(positions, x)
         else:
-            # KDA/GDN forward signature: (positions, hidden_states, output).
-            x = self.attn(positions, x, None)
+            # TPU KDA forward signature: (hidden_states, output).
+            x = self.attn(x, None)
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
@@ -467,56 +467,10 @@ class Glm5NextTextForCausalLM(nn.Module, SupportsPP):
            ``shared_head.``, ``eh_proj``, ``enorm``, ``hnorm``) tensors.
         """
 
-        # Buffer KDA fused projection / conv shards per layer; everything
-        # else is name-translated and loaded directly via AutoWeightsLoader.
-        kda_in_proj: dict[str, dict[str, torch.Tensor]] = {}
-        kda_conv: dict[str, dict[str, torch.Tensor]] = {}
-        passthrough: list[tuple[str, torch.Tensor]] = []
-
-        in_proj_names = ("q_proj", "k_proj", "v_proj", "f_a_proj", "g_a_proj",
-                         "b_proj")
-        conv_names = ("q_conv1d", "k_conv1d", "v_conv1d")
-
-        for name, weight in weights:
-            tname = self._translate_weight_name(name)
-            if tname is None:
-                continue
-            handled = False
-            for proj in in_proj_names:
-                if f".{proj}." in tname and "self_attn" not in tname:
-                    base = tname.replace(f".{proj}.", ".in_proj_qkvgfab.")
-                    kda_in_proj.setdefault(base, {})[proj] = weight
-                    handled = True
-                    break
-            if not handled:
-                for proj in conv_names:
-                    if f".{proj}." in tname:
-                        base = tname.replace(f".{proj}.", ".conv1d.")
-                        kda_conv.setdefault(base, {})[proj] = weight
-                        handled = True
-                        break
-            if not handled:
-                passthrough.append((tname, weight))
-
-        # Fuse the KDA input projections in (q, k, v, f_a, g_a, b) order.
-        params = dict(self.named_parameters())
-        if kda_in_proj:
-            sample = next(iter(kda_in_proj))
-            close = [n for n in params
-                     if "in_proj_qkvgfab" in n or "layers.0.attn." in n][:12]
-            logger.info(
-                "KDA fusion: %d in_proj bases, sample base=%r; closest "
-                "registered params=%s", len(kda_in_proj), sample, close)
-        for base, shards in kda_in_proj.items():
-            ordered = [shards[p] for p in in_proj_names if p in shards]
-            fused = torch.cat(ordered, dim=0)
-            default_weight_loader(params[base], fused)
-        # Fuse the short-conv weights in (q, k, v) order.
-        for base, shards in kda_conv.items():
-            ordered = [shards[p] for p in conv_names if p in shards]
-            fused = torch.cat(ordered, dim=0)
-            default_weight_loader(params[base], fused)
-
+        # The TPU KDA build keeps separate q/k/v/f_a/f_b/g_a/g_b/b_proj and
+        # q/k/v_conv1d whose names match the checkpoint after the prefix
+        # remap (self_attn -> attn), so no fusing is needed; we only rename
+        # and delegate to AutoWeightsLoader.
         loader = AutoWeightsLoader(
             self,
             ignore_unexpected_prefixes=[
@@ -525,19 +479,17 @@ class Glm5NextTextForCausalLM(nn.Module, SupportsPP):
                 "model.layers.45.",
             ],
         )
-        loader.load_weights(iter(passthrough))
+        translated = (
+            (self._translate_weight_name(name), weight)
+            for name, weight in weights)
+        loader.load_weights(
+            (n, w) for n, w in translated if n is not None)
 
     # ------------------------------------------------------------------
     # Weight-name translation (HF checkpoint -> this vLLM port)
     # ------------------------------------------------------------------
 
-    # KDA projections fused into `in_proj_qkvgfab` (q, k, v, f_a, g_a, b).
-    _KDA_PROJS = ("q_proj", "k_proj", "v_proj", "f_a_proj", "g_a_proj",
-                  "b_proj")
-    _KDA_CONVS = ("q_conv1d", "k_conv1d", "v_conv1d")
-
-    @classmethod
-    def _translate_weight_name(cls, name: str) -> str | None:
+    def _translate_weight_name(self, name: str) -> str | None:
         """Translate an HF checkpoint tensor name to this port's layout.
 
         Returns None for tensors that should be skipped (vision / MTP).
@@ -551,14 +503,21 @@ class Glm5NextTextForCausalLM(nn.Module, SupportsPP):
                 or ".shared_head." in name or ".mapping_proj." in name:
             return "model.layers.45." + name
 
-        is_kda = any(f".{p}." in name for p in cls._KDA_PROJS +
-                     cls._KDA_CONVS + ("f_b_proj", "g_b_proj")) or \
-            "A_log" in name or "dt_bias" in name
-        if is_kda:
-            # KDA block stored as `attn`; keep projection names for fusing.
-            return name.replace("self_attn.", "attn.")
-        # MLA path: self_attn -> attn.attn_mha (upstream module name).
-        name = name.replace("self_attn.", "attn.attn_mha.")
+        # KDA layers store the block as `attn` (same as MLA); only the MLA
+        # submodule names (q_a/q_b/kv_a/kv_b + layernorms + indexer) map to
+        # the upstream `attn.attn_mha` nesting. KDA names pass through.
+        is_mla = any(k in name for k in (
+            "q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj", "q_a_layernorm",
+            "kv_a_layernorm", "indexer."))
+        # o_proj/o_norm appear in both KDA and MLA; decide by layer type.
+        if not is_mla and (".self_attn.o_proj." in name or
+                           ".self_attn.o_norm." in name):
+            layer_idx = int(name.split("model.layers.")[1].split(".", 1)[0])
+            is_mla = not _is_kda_layer(self.config, layer_idx)
+        if is_mla:
+            name = name.replace("self_attn.", "attn.attn_mha.")
+        else:
+            name = name.replace("self_attn.", "attn.")
         # MoE / MLP: mlp -> ffn.
         name = name.replace("mlp.", "ffn.")
         return name

@@ -15,11 +15,12 @@
 
 The KDA block used by GLM-5.3-Flash's ``linear_attention`` layers shares the
 exact projection / gating structure of vLLM's ``KimiGatedDeltaNetAttention``
-(fused ``in_proj_qkvgfab`` input projection, low-rank forget gate
+(separate ``q/k/v_proj`` + ``q/k/v_conv1d``, low-rank forget gate
 ``f_a -> f_b`` producing a per-head scalar gate, low-rank output gate
 ``g_a -> g_b``). Only the delta-rule core differs: on TPU it runs through the
-JAX GDN kernel (``run_jax_gdn_attention``) instead of vLLM's Triton KDA
-kernels, reusing the same ``gdn_attention_core_tpu`` bridge as Qwen GDN.
+JAX GDN kernel (``run_jax_gdn_attention``) instead of vLLM's
+``torch.ops.vllm.kda_attention`` (Triton), reusing the same
+``gdn_attention_core_tpu`` bridge as Qwen GDN.
 """
 
 import torch
@@ -40,10 +41,11 @@ logger = init_logger(__name__)
 class VllmKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
     """TPU bring-up of Kimi KDA (Kimi Delta Attention).
 
-    Mirrors upstream vLLM's ``KimiGatedDeltaNetAttention`` for Part 1 (input
-    projection) and Part 3 (gated norm + output projection); Part 2 (short
-    conv1d + chunked/recurrent delta rule) is delegated to
-    ``gdn_attention_core_tpu`` so it runs on the TPU JAX GDN kernel.
+    Mirrors upstream vLLM's ``KimiGatedDeltaNetAttention`` for the projection
+    and output-gate/norm; the conv + chunked/recurrent delta-rule core is
+    delegated to ``gdn_attention_core_tpu`` so it runs on the TPU JAX GDN
+    kernel. The JAX kernel expects a fused ``mixed_qkv`` (num_tokens,
+    3*num_heads*head_dim), a fused conv weight, and per-head beta/gate.
     """
 
     # Attribute aliases expected by ``gdn_attention_core_tpu`` (which reads
@@ -68,19 +70,41 @@ class VllmKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
     def conv_kernel_size(self) -> int:
         return self.conv_size
 
+    @property
+    def conv1d(self):
+        """Fused (q, k, v) conv1d view expected by the TPU GDN core.
+
+        The JAX kernel consumes a single conv weight of shape
+        ``(3*num_heads*head_dim, 1, kernel_size)``; this build keeps them as
+        three separate ``{q,k,v}_conv1d`` Linears, so we fuse lazily.
+        """
+        if getattr(self, "_fused_conv1d_weight", None) is None:
+            w = torch.cat(
+                [
+                    self.q_conv1d.weight,
+                    self.k_conv1d.weight,
+                    self.v_conv1d.weight,
+                ],
+                dim=0,
+            )
+            self._fused_conv1d_weight = w
+
+        class _Conv:
+            weight = self._fused_conv1d_weight
+            bias = None
+
+        return _Conv()
+
     def forward(
         self,
-        positions: torch.Tensor,
         hidden_states: torch.Tensor,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """KDA forward with the delta-rule core on the TPU JAX kernel.
 
         Args:
-            positions: Token positions (unused by the GDN/KDA core, which is
-                position-independent; kept for interface parity).
             hidden_states: ``(num_tokens, hidden_size)``.
-            output: Optional preallocated output buffer.
+            output: Preallocated output buffer (num_tokens, hidden_size).
 
         Returns:
             ``(num_tokens, hidden_size)`` attention output.
@@ -90,36 +114,24 @@ class VllmKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
 
         # ---------------- Part 1: input projection ----------------
-        projected_qkvgfab, _ = self.in_proj_qkvgfab(hidden_states)
-        if self.use_full_rank_gate:
-            split_sizes = [
-                3 * self.local_projection_size,
-                self.local_projection_size,
-                self.head_dim,
-                self.local_num_heads,
-            ]
-            if self.in_proj_padding:
-                split_sizes.append(self.in_proj_padding)
-            projected = projected_qkvgfab.split(split_sizes, dim=-1)
-            mixed_qkv, g_proj_states, f_a, beta = projected[:4]
-            g = g_proj_states
-        else:
-            mixed_qkv, beta, f_a = projected_qkvgfab.split(
-                [
-                    3 * self.local_projection_size,
-                    self.local_num_heads,
-                    self.head_dim,
-                ],
-                dim=-1,
-            )
-            g, _ = self.g_b_proj(self.g_a_proj(hidden_states)[0])
+        q, _ = self.q_proj(hidden_states)
+        k, _ = self.k_proj(hidden_states)
+        v, _ = self.v_proj(hidden_states)
+        # Fused (num_tokens, 3 * num_heads * head_dim), matching the
+        # non-interleaved [Q Q | K K | V V] layout the JAX GDN core expects.
+        mixed_qkv = torch.cat([q, k, v], dim=-1)
 
         # Forget gate: low-rank f_a -> f_b -> per-head scalar gate g1.
+        f_a, _ = self.f_a_proj(hidden_states)
         g1, _ = self.f_b_proj(f_a)
+        # Beta gate.
+        beta, _ = self.b_proj(hidden_states)
+        # Output gate (low-rank g_a -> g_b).
+        g_proj_states, _ = self.g_b_proj(self.g_a_proj(hidden_states)[0])
+        g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
 
         # ---------------- Part 2: core attention (TPU kernel) ----------------
-        # The TPU GDN kernel expects beta (b) and the per-head gate (a) as
-        # (num_tokens, num_v_heads); g1 is already per-head (num_tokens, 64).
+        # beta and g1 are per-head (num_tokens, num_heads).
         b = beta.contiguous().view(num_tokens, -1)
         a = g1.contiguous().view(num_tokens, -1)
 
@@ -131,10 +143,11 @@ class VllmKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         gdn_attention_core_tpu(mixed_qkv, b, a, core_attn_out, self.prefix,
                                mesh=mesh)
 
-        # ---------------- Part 3: output projection ----------------
-        core_attn_out = self.o_norm(core_attn_out, g)
+        # ---------------- Part 3: gated norm + output projection ----------------
+        core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        proj_out, _ = self.o_proj(core_attn_out)
         if output is not None:
-            output[:num_tokens], _ = self.o_proj(core_attn_out)
+            output[:num_tokens] = proj_out
             return output
-        return self.o_proj(core_attn_out)[0]
+        return proj_out
