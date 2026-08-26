@@ -501,10 +501,18 @@ class Glm5NextTextForCausalLM(nn.Module, SupportsPP):
                     loader_fn(param, shards[shard], shard_ids[shard])
                 scale_key = f"{shard}_scale"
                 if scale_key in shards:
-                    # weight_scale_inv has no shard loader; both gate and up
-                    # scale tensors land in the same fused scale buffer.
+                    # The fused gate_up_proj.weight_scale_inv is block-stacked
+                    # exactly like the weight, so shard it the same way.
                     scale_param = params[base]
-                    default_weight_loader(scale_param, shards[scale_key])
+                    scale_loader = getattr(scale_param, "weight_loader",
+                                           default_weight_loader)
+                    try:
+                        scale_loader(scale_param, shards[scale_key],
+                                     shard_ids[shard])
+                    except (IndexError, TypeError, AssertionError):
+                        # Fallback for loaders without shard support.
+                        default_weight_loader(scale_param,
+                                              shards[scale_key])
 
         loader = AutoWeightsLoader(
             self,
