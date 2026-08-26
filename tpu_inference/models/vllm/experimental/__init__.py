@@ -24,6 +24,11 @@ _TPU_VLLM_MODELS = {
     # routed to the TPU PallasMLA backend by the register_oot MLA wrapper.
     "GlmMoeDsaForCausalLM":
     "tpu_inference.models.vllm.experimental.glm_moe_dsa:GlmMoeDsaForCausalLM",
+    # GLM-5.3-Flash (zai-org/GLM-5.3-Flash) text backbone: hybrid KDA linear
+    # attention + MLA(+DSA) layers, mHC residuals, 288-expert MoE. Text-only
+    # bring-up; the multimodal wrapper is a follow-up.
+    "Glm5NextTextForCausalLM":
+    "tpu_inference.models.vllm.experimental.glm5_next:Glm5NextTextForCausalLM",
 }
 
 
