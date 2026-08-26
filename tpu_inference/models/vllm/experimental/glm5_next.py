@@ -401,6 +401,10 @@ class Glm5NextTextForCausalLM(nn.Module, SupportsPP):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # vLLM's VllmModel protocol entrypoint.
+        return self.get_input_embeddings(input_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor,
