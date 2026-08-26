@@ -532,6 +532,11 @@ class Glm5NextTextForCausalLM(nn.Module, SupportsPP):
         if ".eh_proj." in name or ".enorm." in name or ".hnorm." in name \
                 or ".shared_head." in name or ".mapping_proj." in name:
             return "model.layers.45." + name
+        # The checkpoint stores MTP next-layer tensors as model.layers.45.*;
+        # the base model only has layers 0..44, so skip them before any
+        # layer-type lookup (which would index out of range).
+        if name.startswith("model.layers.45."):
+            return None
 
         # KDA layers store the block as `attn` (same as MLA); only the MLA
         # submodule names (q_a/q_b/kv_a/kv_b + layernorms + indexer) map to
